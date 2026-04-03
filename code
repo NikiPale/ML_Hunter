@@ -1,0 +1,395 @@
+import pandas as pd
+import re
+import logging
+from transformers import pipeline
+from tqdm import tqdm
+from datetime import datetime
+import os
+
+# ============================================================
+# 📁 ФАЙЛЫ — укажите свои пути к файлам
+# ============================================================
+INPUT_FILE = "companies.xlsx"        # ← Ваш входной файл с данными
+OUTPUT_FILE = "companies_labeled.xlsx"   # ← Файл с результатами классификации
+CHECKPOINT_FILE = "checkpoint.xlsx"  # ← Временный файл (создаётся автоматически)
+LOG_FILE = "classification.log"      # ← Лог-файл
+
+# ============================================================
+# 📌 КОЛОНКА — укажите имя колонки с названиями организаций
+# ============================================================
+COMPANY_COLUMN = "company_name"      # ← Замените на имя вашей колонки в Excel-файле
+
+# ============================================================
+# ⚙️ ПОРОГИ УВЕРЕННОСТИ — можно оставить как есть или настроить
+# ============================================================
+HIGH_CONF = 0.70
+MEDIUM_CONF = 0.50
+CHECKPOINT_INTERVAL = 50             # ← Каждые N компаний сохраняется промежуточный результат
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+
+if not os.path.exists(INPUT_FILE):
+    raise FileNotFoundError(f"⚠️  Файл {INPUT_FILE} не найден!")
+
+print("🔄 Загрузка модели...")
+logging.info("Загрузка mDeBERTa-v3-base-mnli-xnli")
+
+try:
+    classifier = pipeline(
+        "zero-shot-classification",
+        model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+        device=-1
+    )
+    logging.info("✅ Модель загружена")
+except Exception as e:
+    logging.error(f"❌ Ошибка загрузки: {e}")
+    raise
+
+
+# ============================================================
+# 🟢 СИЛЬНЫЕ МАРКЕРЫ — слова, которые ТОЧНО указывают на вашу тему
+#
+# Пример: если ищете IT-компании → "разработ", "программ", "софт", "цифров"
+# Пример: если ищете медицинские → "клиник", "больниц", "медицин", "лечебн"
+#
+# ❗ Регистр не важен. Используйте корень слова (без окончания),
+#    чтобы охватить все формы: "медицин" → "медицинский", "медицина" и т.д.
+# ============================================================
+STRONG_MARKERS = [
+    "слово1",    # ← Замените на ключевые слова вашей темы
+    "слово2",
+    "слово3",
+    # ... добавьте нужное количество
+]
+
+# ============================================================
+# 🟡 СРЕДНИЕ МАРКЕРЫ — слова, которые КОСВЕННО указывают на тему
+#
+# Используются для повышения уверенности модели,
+# но сами по себе не дают однозначного ответа.
+# ============================================================
+MEDIUM_MARKERS = [
+    "слово4",    # ← Замените на вспомогательные слова вашей темы
+    "слово5",
+    "слово6",
+    # ...
+]
+
+# ============================================================
+# 🔴 ИСКЛЮЧАЮЩИЕ МАРКЕРЫ — слова, которые ТОЧНО НЕ ваша тема
+#
+# Организации с этими словами будут сразу помечены как "не подходит"
+# (если у них нет средних маркеров).
+# ============================================================
+EXCLUDE_MARKERS = [
+    "слово7",    # ← Замените на слова, которые однозначно исключают организацию
+    "слово8",
+    "слово9",
+    # ...
+]
+
+
+# ============================================================
+# 🏷️ МЕТКИ ДЛЯ ZERO-SHOT КЛАССИФИКАЦИИ
+#
+# Напишите на английском, ЧТО именно вы ищете.
+# Модель сравнивает название компании с каждой меткой.
+#
+# ВАРИАНТ 1: Двухуровневый (простой — "да / нет")
+#   Лучше всего подходит для большинства задач.
+# ============================================================
+ZS_LABELS_V1 = [
+    # ← Опишите организацию, которую вы ИЩЕТЕ
+    "Organization that [ВПИШИТЕ СЮДА ОПИСАНИЕ ЦЕЛЕВОГО АГЕНТА]",
+
+    # ← Опишите организацию, которую вы НЕ ИЩЕТЕ
+    "Organization that does NOT [ВПИШИТЕ СЮДА ЧТО НЕ ПОДХОДИТ]"
+]
+
+# ------------------------------------------------------------
+# ВАРИАНТ 2: Трёхуровневый (более точный)
+#   Добавляет промежуточную категорию — некоммерческие, но не целевые.
+# ------------------------------------------------------------
+ZS_LABELS_V2 = [
+    # ← Точное описание целевой организации
+    "[ВПИШИТЕ ОСНОВНОЙ ПРИЗНАК ЦЕЛЕВОЙ ОРГАНИЗАЦИИ]",
+
+    # ← Смежные, но не целевые
+    "[ВПИШИТЕ ОПИСАНИЕ ПОХОЖИХ, НО НЕ ПОДХОДЯЩИХ ОРГАНИЗАЦИЙ]",
+
+    # ← Явно не подходящие
+    "[ВПИШИТЕ ОПИСАНИЕ ЯВНО НЕЦЕЛЕВЫХ ОРГАНИЗАЦИЙ]"
+]
+
+# ------------------------------------------------------------
+# ВАРИАНТ 3: Прямой вопрос (самый простой)
+#   Используйте, если два варианта выше дают плохие результаты.
+# ------------------------------------------------------------
+ZS_LABELS_V3 = [
+    # ← Опишите одним предложением целевую организацию
+    "Organization that [ВПИШИТЕ ПРИЗНАК ЦЕЛЕВОГО АГЕНТА]",
+
+    # ← Противоположное описание
+    "Organization that does NOT [ВПИШИТЕ ПРИЗНАК НЕЦЕЛЕВОГО АГЕНТА]"
+]
+
+# ============================================================
+# ✅ ВЫБОР АКТИВНОГО ВАРИАНТА МЕТОК
+# ← Замените ZS_LABELS_V1 на V2 или V3, если хотите другой вариант
+# ============================================================
+ZS_LABELS = ZS_LABELS_V1
+
+
+# ============================================================
+# 🏷️ ИТОГОВЫЕ МЕТКИ — что будет записано в результирующий файл
+#
+# Замените строки ниже на понятные названия для ваших категорий.
+# ============================================================
+LABEL_POSITIVE = "Целевой агент"       # ← Метка для подходящих организаций
+LABEL_NEGATIVE = "Не целевой агент"    # ← Метка для неподходящих организаций
+LABEL_UNCERTAIN = "Не определено"      # ← Метка при низкой уверенности модели
+
+
+# ============================================================
+# ℹ️ ПОДСКАЗКА ДЛЯ МОДЕЛИ (prompt)
+#
+# Этот текст отправляется в модель вместе с названием компании.
+# Чем точнее вы опишете задачу, тем лучше результат.
+# Пишите на английском.
+# ============================================================
+def build_prompt(clean_name: str) -> str:
+    return (
+        f'Organization name: "{clean_name}". '
+        # ← Замените текст ниже на описание вашей задачи классификации
+        f'Task: [ОПИШИТЕ ЗАДАЧУ — ЧТО НУЖНО ОПРЕДЕЛИТЬ В ЭТОЙ ОРГАНИЗАЦИИ]. '
+        f'[ДОБАВЬТЕ УТОЧНЕНИЯ — КАКИЕ ОРГАНИЗАЦИИ ТОЧНО ПОДХОДЯТ / НЕ ПОДХОДЯТ].'
+    )
+
+
+# =================== СЛУЖЕБНЫЕ ФУНКЦИИ (не требуют изменений) ===================
+
+def clean(name):
+    if pd.isna(name):
+        return ""
+    text = re.sub(r'[\"«»]', '', str(name).lower())
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def find_keyword(keywords, text):
+    """Поиск с границами слов"""
+    for k in keywords:
+        if re.search(r'\b' + re.escape(k), text, re.IGNORECASE):
+            return k
+    return None
+
+
+def confidence_bucket(score):
+    if score >= HIGH_CONF:
+        return "High"
+    if score >= MEDIUM_CONF:
+        return "Medium"
+    return "Low"
+
+
+def is_positive_label(label: str) -> bool:
+    """
+    Определяет, является ли метка позитивной (целевой).
+    Модель возвращает строку из ZS_LABELS — проверяем, совпадает ли она
+    с первой меткой (позитивной).
+
+    ⚠️ Если вы изменили ZS_LABELS, убедитесь что первая метка — целевая.
+    """
+    return label == ZS_LABELS[0]
+
+
+def classify(name):
+    clean_name = clean(name)
+
+    row = {
+        "company_name": name,
+        "clean_name": clean_name,
+        "label": "Unknown",
+        "confidence": 0.0,
+        "confidence_bucket": "Low",
+        "source": "",
+        "reasoning": ""
+    }
+
+    if not clean_name or len(clean_name) < 3:
+        row["label"] = "Invalid"
+        row["reasoning"] = "Пустое название"
+        return row
+
+    # Проверка сильных маркеров → сразу помечаем как целевой
+    strong = find_keyword(STRONG_MARKERS, clean_name)
+    if strong:
+        logging.info(f"✅ Сильный маркер: '{strong}' → {name}")
+        row.update({
+            "label": LABEL_POSITIVE,
+            "confidence": 0.95,
+            "confidence_bucket": "High",
+            "source": "Strong keyword",
+            "reasoning": f"Маркер: {strong}"
+        })
+        return row
+
+    # Проверка исключающих маркеров → сразу помечаем как нецелевой
+    excluded = find_keyword(EXCLUDE_MARKERS, clean_name)
+    if excluded:
+        if not find_keyword(MEDIUM_MARKERS, clean_name):
+            logging.info(f"❌ Исключён: '{excluded}' → {name}")
+            row.update({
+                "label": LABEL_NEGATIVE,
+                "confidence": 0.85,
+                "confidence_bucket": "High",
+                "source": "Exclude keyword",
+                "reasoning": f"Исключающий маркер: {excluded}"
+            })
+            return row
+
+    # Средний маркер — повысит уверенность при положительном ML-результате
+    medium = find_keyword(MEDIUM_MARKERS, clean_name)
+
+    # Zero-shot классификация через ML
+    prompt = build_prompt(clean_name)
+
+    try:
+        result = classifier(prompt, candidate_labels=ZS_LABELS)
+        label = result["labels"][0]
+        score = result["scores"][0]
+
+        positive = is_positive_label(label)
+
+        if medium and positive:
+            score = min(score + 0.15, 0.95)
+            reasoning = f"ML + маркер '{medium}'"
+            logging.info(f"⬆️  Уверенность повышена: {name}")
+        else:
+            reasoning = "ML классификация"
+
+        row["label"] = LABEL_POSITIVE if positive else LABEL_NEGATIVE
+        row["confidence"] = round(score, 3)
+        row["confidence_bucket"] = confidence_bucket(score)
+        row["source"] = "Zero-shot ML"
+        row["reasoning"] = reasoning
+
+        if score < MEDIUM_CONF:
+            row["label"] = LABEL_UNCERTAIN
+            row["reasoning"] = "Низкая уверенность ML"
+            logging.warning(f"⚠️  Низкая уверенность ({score:.2f}): {name}")
+
+        return row
+
+    except Exception as e:
+        logging.error(f"❌ ML ошибка: {name} — {e}")
+        row.update({
+            "label": "Error",
+            "source": "ML Error",
+            "reasoning": str(e)[:50]
+        })
+        return row
+
+
+# ================= MAIN =================
+
+def main():
+    print(f"\n{'='*70}")
+
+    # ← Замените название задачи на своё
+    print(f"🚀 Классификация компаний по теме: [ВАША ТЕМА]")
+    print(f"{'='*70}")
+    print(f"📝 Используемые метки: {len(ZS_LABELS)} варианта")
+    for i, lbl in enumerate(ZS_LABELS, 1):
+        print(f"   {i}️⃣  {lbl[:70]}...")
+    print(f"{'='*70}\n")
+
+    df = pd.read_excel(INPUT_FILE)
+
+    if COMPANY_COLUMN not in df.columns:
+        raise ValueError(f"⚠️  Колонка '{COMPANY_COLUMN}' не найдена!")
+
+    names = df[COMPANY_COLUMN].tolist()
+    total = len(names)
+    logging.info(f"Всего компаний: {total}")
+
+    results = []
+    print(f"🔍 Обработка {total} компаний...\n")
+
+    for i, name in enumerate(tqdm(names, desc="Классификация")):
+        try:
+            res = classify(name)
+            results.append(res)
+        except Exception as e:
+            logging.error(f"❌ Критическая ошибка: {name} — {e}")
+            results.append({
+                "company_name": name,
+                "clean_name": "",
+                "label": "Error",
+                "confidence": 0.0,
+                "confidence_bucket": "Low",
+                "source": "Critical Error",
+                "reasoning": str(e)[:100]
+            })
+
+        if (i + 1) % CHECKPOINT_INTERVAL == 0:
+            try:
+                pd.DataFrame(results).to_excel(CHECKPOINT_FILE, index=False)
+                logging.info(f"💾 Checkpoint: {i+1}/{total}")
+            except Exception as e:
+                logging.error(f"❌ Ошибка checkpoint: {e}")
+
+    out = pd.DataFrame(results)
+    out.to_excel(OUTPUT_FILE, index=False)
+
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+        logging.info("🗑️  Checkpoint удалён")
+
+    print(f"\n{'='*70}")
+    print(f"✅ Готово!")
+    print(f"{'='*70}\n")
+
+    print("📊 Распределение по меткам:\n")
+    print(out["label"].value_counts().to_string())
+
+    print(f"\n📊 Распределение по уверенности:\n")
+    print(out["confidence_bucket"].value_counts().to_string())
+
+    print(f"\n📊 Распределение по источникам:\n")
+    print(out["source"].value_counts().to_string())
+
+    print(f"\n📁 Результат: {OUTPUT_FILE}")
+    print(f"📄 Лог: {LOG_FILE}\n")
+
+    print("📋 Примеры результатов:\n")
+    cols = ["company_name", "label", "confidence", "reasoning"]
+    print(out[cols].head(15).to_string(index=False))
+    print()
+
+
+if __name__ == "__main__":
+    try:
+        start = datetime.now()
+        main()
+        duration = (datetime.now() - start).total_seconds()
+        print(f"⏱️  {duration:.1f} сек\n")
+
+    except KeyboardInterrupt:
+        print("\n⚠️  Прервано")
+        if 'results' in locals():
+            emergency = f"emergency_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+            pd.DataFrame(results).to_excel(emergency, index=False)
+            print(f"💾 {emergency}")
+
+    except Exception as e:
+        print(f"\n❌ {e}")
+        logging.error(f"Критическая ошибка: {e}", exc_info=True)
+        raise
